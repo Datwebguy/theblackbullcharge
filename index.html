@@ -415,6 +415,11 @@
       }
       throw lastError||new Error('No Solana RPC endpoint is available.');
     }
+    async function rpcCandidates(){
+      const {web3}=await solanaDeps;
+      const endpoints=[connection?.rpcEndpoint,SOLANA_CONFIG.rpc,...SOLANA_CONFIG.rpcFallbacks].filter((v,i,a)=>v&&a.indexOf(v)===i);
+      return endpoints.map(endpoint=>connection?.rpcEndpoint===endpoint?connection:new web3.Connection(endpoint,'confirmed'));
+    }
     function setStatus(message,type='pending',linger=4200){
       clearTimeout(statusTimer);ui.status.textContent=message;ui.status.className=`status-toast show ${type}`;
       if(linger)statusTimer=setTimeout(()=>ui.status.className='status-toast',linger);
@@ -802,23 +807,51 @@
     function reverseSwapDirection(){
       swapDirectionMode=swapDirectionMode==='buy'?'sell':'buy';swapQuote=null;$('#swapAmount').value='';updateSwapDirectionUI();refreshSwapBalances();scheduleQuote();
     }
-    async function confirmSwapSignature(signature,lastValidBlockHeight){
+    async function readSwapStatus(signature){
+      const clients=await rpcCandidates();
+      const results=await Promise.allSettled(clients.map(rpc=>rpc.getSignatureStatuses([signature],{searchTransactionHistory:true})));
+      const statuses=results.filter(result=>result.status==='fulfilled').map(result=>result.value.value[0]).filter(Boolean);
+      return statuses.find(status=>status.err)||statuses.find(status=>status.confirmationStatus==='finalized')||statuses.find(status=>status.confirmationStatus==='confirmed')||statuses[0]||null;
+    }
+    async function swapBlockhashIsValid(blockhash){
+      if(!blockhash)return true;
+      const clients=await rpcCandidates();
+      const results=await Promise.allSettled(clients.map(rpc=>rpc.isBlockhashValid(blockhash,{commitment:'confirmed'})));
+      const values=results.filter(result=>result.status==='fulfilled').map(result=>Boolean(result.value.value));
+      // An RPC outage must never be mistaken for transaction expiry.
+      return values.length?values.some(Boolean):true;
+    }
+    async function broadcastSignedSwap(wire,preflight=false){
+      const clients=await rpcCandidates();
+      const results=await Promise.allSettled(clients.map(rpc=>rpc.sendRawTransaction(wire,{
+        skipPreflight:!preflight,preflightCommitment:'confirmed',maxRetries:0
+      })));
+      const accepted=results.filter(result=>result.status==='fulfilled');
+      if(accepted.length)return accepted[0].value;
+      throw results.find(result=>result.status==='rejected')?.reason||new Error('No RPC accepted the signed swap.');
+    }
+    async function confirmSwapSignature(signature,recentBlockhash,wire){
       const started=Date.now();
+      let lastBroadcast=0,invalidChecks=0;
       while(Date.now()-started<95000){
         try{
-          const statuses=await withRpcFailover(rpc=>rpc.getSignatureStatuses([signature],{searchTransactionHistory:true}));
-          const status=statuses.value[0];
+          const status=await readSwapStatus(signature);
           if(status){
             if(status.err)throw new Error(`Swap failed on-chain: ${JSON.stringify(status.err)}`);
             if(status.confirmationStatus==='confirmed'||status.confirmationStatus==='finalized')return status;
           }
-          if(lastValidBlockHeight){
-            const height=await withRpcFailover(rpc=>rpc.getBlockHeight('confirmed'));
-            if(height>lastValidBlockHeight){
-              // One final history lookup prevents a lagging RPC from reporting
-              // a landed transaction as expired.
-              const finalStatuses=await withRpcFailover(rpc=>rpc.getSignatureStatuses([signature],{searchTransactionHistory:true}));
-              const finalStatus=finalStatuses.value[0];
+          // Re-send the exact same bytes through every available RPC. Since
+          // the signature is unchanged, this cannot execute the swap twice.
+          if(wire&&Date.now()-lastBroadcast>2200){
+            lastBroadcast=Date.now();
+            await broadcastSignedSwap(wire).catch(()=>{});
+          }
+          if(Date.now()-started>3500&&recentBlockhash){
+            if(await swapBlockhashIsValid(recentBlockhash))invalidChecks=0;
+            else if(++invalidChecks>=2){
+              // Require two invalid readings plus a final history lookup so a
+              // lagging public RPC cannot falsely declare a landed swap dead.
+              const finalStatus=await readSwapStatus(signature);
               if(finalStatus?.err)throw new Error(`Swap failed on-chain: ${JSON.stringify(finalStatus.err)}`);
               if(finalStatus&&!finalStatus.err)return finalStatus;
               const expired=new Error('Swap authorization expired before the transaction landed. No swap was confirmed.');
@@ -829,7 +862,7 @@
           if(error?.code==='SWAP_EXPIRED'||/failed on-chain/i.test(String(error?.message)))throw error;
           if(Date.now()-started>90000)throw error;
         }
-        await sleep(1200);
+        await sleep(1100);
       }
       const timeout=new Error('Swap confirmation timed out. Check the signature on Solscan before retrying.');
       timeout.code='SWAP_TIMEOUT';timeout.signature=signature;throw timeout;
@@ -858,7 +891,9 @@
           body:JSON.stringify({
             quoteResponse,userPublicKey:walletKey.toBase58(),
             wrapAndUnwrapSol:true,dynamicComputeUnitLimit:true,
-            prioritizationFeeLamports:'auto'
+            prioritizationFeeLamports:{
+              priorityLevelWithMaxLamports:{priorityLevel:'high',maxLamports:200000,global:false}
+            }
           })
         });
         const built=await response.json();
@@ -868,23 +903,24 @@
         const payer=transaction.message.staticAccountKeys[0];
         if(!payer?.equals(walletKey))throw new Error('Security check failed: swap fee payer does not match connected wallet.');
         if(transaction.message.header.numRequiredSignatures!==1||transaction.signatures.length!==1)throw new Error('Security check failed: unexpected signer layout.');
-        if(built.lastValidBlockHeight){
-          const currentHeight=await withRpcFailover(rpc=>rpc.getBlockHeight('confirmed'));
-          if(built.lastValidBlockHeight-currentHeight<60)throw new Error('Jupiter returned a nearly expired transaction. Please request a fresh quote.');
-        }
+        const recentBlockhash=transaction.message.recentBlockhash;
+        if(!recentBlockhash)throw new Error('Jupiter returned a transaction without a recent blockhash.');
+        // Lite can return stale lastValidBlockHeight metadata even while the
+        // blockhash embedded in the transaction is current. Track the actual
+        // blockhash instead of comparing heights from unrelated RPC services.
         setStatus('Confirm in wallet…','pending',0);button.textContent='Confirm in wallet…';
-        let signature;
+        let signature,wire=null;
         if(walletProvider.signTransaction){
           const signed=await walletProvider.signTransaction(transaction);
-          setStatus('Swapping… waiting for Solana confirmation.','pending',0);button.textContent='Swapping…';
-          const wire=signed.serialize();
-          signature=await withRpcFailover(rpc=>rpc.sendRawTransaction(wire,{skipPreflight:false,preflightCommitment:'confirmed',maxRetries:5}));
+          setStatus('Broadcasting swap across Solana…','pending',0);button.textContent='Swapping…';
+          wire=signed.serialize();
+          signature=await broadcastSignedSwap(wire,true);
         }else{
           const sent=await walletProvider.signAndSendTransaction(transaction);signature=typeof sent==='string'?sent:sent?.signature;
         }
         if(!signature)throw new Error('Wallet returned no transaction signature.');
         submittedSignature=signature;
-        await confirmSwapSignature(signature,built.lastValidBlockHeight);
+        await confirmSwapSignature(signature,recentBlockhash,wire);
         await refreshBalance();await refreshSwapBalances();swapQuote=null;$('#swapAmount').value='';$('#swapOutput').value='0';
         closeModal(ui.swapModal);flash=.8;shake=8;burst(bull.x+bull.w/2,bull.y+bull.h/2,'#ffcc00',34,230);
         ui.status.innerHTML=`Bull powered up! <a class="tx-link" href="https://solscan.io/tx/${signature}" target="_blank" rel="noopener">View on Solscan ↗</a>`;
