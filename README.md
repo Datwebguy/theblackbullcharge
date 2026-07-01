@@ -25,6 +25,11 @@ It begins with a short cinematic about the Black Bull project, then drops you
 straight into the run. Space, click or tap to jump. Collect the spinning
 $ANSEM coins, watch the market move behind you and try not to get bonked.
 
+The original **Charge Forward** score is synthesized live in the browser.
+Its bass, drums, horns, arpeggios and crowd-like $ANSEM chant build with the
+speed of the run. Coin streaks add melodic flourishes, boosts open up the mix
+and a crash drags the whole track down with the bull.
+
 This is more than a themed runner. A connected Solana wallet turns the game
 into a small $ANSEM utility hub. Players can check real balances, swap through
 Jupiter, buy boosts and sign a non-custodial multiplier pledge without leaving
